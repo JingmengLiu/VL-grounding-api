@@ -1,0 +1,11 @@
+uvicorn
+python-multipart
+pillow
+numpy
+accelerate
+facenet-pytorch
+onnxruntime
+pandas
+timm
+tqdm
+huggingface_hub
