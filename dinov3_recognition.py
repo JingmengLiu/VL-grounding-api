@@ -38,23 +38,12 @@ class DinoV3Predictor:
         image = image.convert("RGB")
         with self._lock:
             feature = self._predictor.embedder.encode_images([image])[0]
-            ranked = self._predictor.index.predict(
+            result = self._predictor.index.predict(
                 feature,
                 top_k=top_k,
-                category=None,
+                categories=None,
             )
 
-        if not ranked:
+        if not result:
             raise RuntimeError("DINOv3 classifier returned no candidates")
-
-        top_k_results = [dict(item) for item in ranked]
-        result = dict(top_k_results[0])
-        result["confidence_type"] = "normalized_cosine_not_calibrated"
-        result["margin"] = (
-            float(top_k_results[0]["confidence"])
-            - float(top_k_results[1]["confidence"])
-            if len(top_k_results) > 1
-            else None
-        )
-        result["top_k"] = top_k_results
-        return result
+        return dict(result)
