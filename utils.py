@@ -277,7 +277,7 @@ def _extract_text_from_caption_response(resp_bytes: bytes, content_type: Optiona
 
 
 def call_caption_api(image_pil, prompt: str, url: str, timeout: float = 30.0):
-    """Call the configured multimodal caption API.
+    """Call external caption API (started via uvicorn caption:app --port 7578).
 
     Assumes a multipart/form-data POST with fields:
       - image: uploaded file
@@ -402,116 +402,106 @@ def person_recognition_old(resnet, mtcnn, embedding_dict, image, target, device)
     return to_serializable(target)
  
 
-def _bbox_iou(left, right):
-    x1 = max(float(left[0]), float(right[0]))
-    y1 = max(float(left[1]), float(right[1]))
-    x2 = min(float(left[2]), float(right[2]))
-    y2 = min(float(left[3]), float(right[3]))
-    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    left_area = max(0.0, float(left[2]) - float(left[0])) * max(0.0, float(left[3]) - float(left[1]))
-    right_area = max(0.0, float(right[2]) - float(right[0])) * max(0.0, float(right[3]) - float(right[1]))
-    union = left_area + right_area - intersection
-    return intersection / union if union > 0 else 0.0
+def logo_recognition(processor, model, idx_to_name, image, target, device, threshold=0.7, caption_api_url=None):
+    print('Start recognizing Logo (SigLIP2 + caption-api fallback).')
+    if len(target) == 0:
+        return to_serializable(target)
 
+    prompt = '请判断这是什么公司或组织，只输出英文名。'
 
-def merge_flag_logo_candidates(candidates, iou_threshold=0.7):
-    """Class-agnostic NMS for the combined flag/logo candidate list."""
-    unique = {item['bbox_id']: item for item in candidates}
-    ordered = sorted(
-        unique.values(),
-        key=lambda item: float(item.get('probability', 0.0)),
-        reverse=True,
-    )
-    kept = []
-    for item in ordered:
-        if all(_bbox_iou(item['bbox'], other['bbox']) < iou_threshold for other in kept):
-            kept.append(item)
-    return kept
-
-
-def _flag_logo_fallback_prompt(object_name):
-    normalized = str(object_name).lower()
-    if 'flag' in normalized and 'logo' not in normalized:
-        return '请判断这是什么国家、地区或组织的旗帜，只输出英文名称。'
-    if 'logo' in normalized and 'flag' not in normalized:
-        return '请判断这是什么品牌、公司、政党或组织的标志，只输出英文名称。'
-    return '请判断图中的旗帜或标志属于哪个国家、地区、品牌、公司、政党或组织，只输出英文名称。'
-
-
-def _dinov3_category_dataset(category):
-    return {
-        'flags': 'country-flags-in-the-wild',
-        'Logo': 'Logo-2K+',
-        'Party': 'Party',
-        'Organization': 'Organization',
-    }.get(category, category)
-
-
-def flag_logo_recognition(
-    predictor,
-    image,
-    target,
-    top_k=5,
-    threshold=0.7,
-    caption_api_url=None,
-    nms_iou_threshold=0.7,
-):
-    print('Start recognizing unified Flag/Logo (DINOv3 + caption fallback).')
-    target = merge_flag_logo_candidates(target, iou_threshold=nms_iou_threshold)
     for item in target:
         item_image = crop_image(image, item['bbox'])
-        try:
-            prediction = predictor.predict_image(item_image, top_k=top_k)
-        except Exception as e:
-            print(f"DINOv3 prediction failed for bbox {item.get('bbox_id')}: {e}")
-            continue
+        item_image = _resize_pil(item_image, resize_size=(224, 224))
 
-        confidence = float(prediction['confidence'])
-        result = {
-            'name': prediction.get('class_name', ''),
-            'confidence': confidence,
-            'category': prediction.get('category'),
-            'qid': prediction.get('qid'),
-            'class_key': prediction.get('class_key'),
-            'similarity': prediction.get('similarity'),
-            'margin': prediction.get('margin'),
-            'top_k': prediction.get('top_k', []),
-            'source': 'dinov3',
-        }
+        inputs = processor(images=[item_image], return_tensors='pt')
+        pixel_values = inputs['pixel_values'].to(device)
 
-        if confidence >= float(threshold):
-            item['object_finegrained_name'] = result['name']
-            item['object_finegrained_id'] = result['qid']
-            item['object_finegrained_dataset'] = _dinov3_category_dataset(result['category'])
-            item['object_finegrained_type'] = 'flag_logo'
-            item['flag_logo'] = result
-            continue
+        with torch.no_grad():
+            logits, _ = model(pixel_values=pixel_values)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            conf_val = float(conf.item())
+            pred_idx = int(pred.item())
 
-        if not caption_api_url:
-            continue
-        try:
-            fallback_name = call_caption_api(
-                item_image,
-                prompt=_flag_logo_fallback_prompt(item.get('object_name', '')),
-                url=caption_api_url,
-            ).strip()
-        except Exception as e:
-            print(f"caption-api fallback failed for bbox {item.get('bbox_id')}: {e}")
-            fallback_name = ''
+        if conf_val >= float(threshold):
+            logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+            item['object_finegrained_name'] = logo_name
+            item['logo'] = {'name': logo_name, 'confidence': conf_val}
+        else:
+            if not caption_api_url:
+                logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+                item['object_finegrained_name'] = logo_name
+                item['logo'] = {'name': logo_name, 'confidence': conf_val}
+            else:
+                try:
+                    pred_text = call_caption_api(item_image, prompt=prompt, url=caption_api_url)
+                    pred_text = (pred_text or '').strip()
+                except Exception as e:
+                    print('caption-api failed:', e)
+                    pred_text = ''
 
-        if fallback_name:
-            item['object_finegrained_name'] = fallback_name
-            item['object_finegrained_type'] = 'flag_logo'
-            item['flag_logo'] = {
-                'name': fallback_name,
-                'confidence': confidence,
-                'source': 'multimodal_fallback',
-                'dino_confidence': confidence,
-                'dino_candidate': result['name'],
-                'dino_category': result['category'],
-            }
+                if pred_text:
+                    item['object_finegrained_name'] = pred_text
+                    # Keep confidence numeric for frontend compatibility.
+                    item['logo'] = {'name': pred_text, 'confidence': conf_val}
+                else:
+                    logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+                    item['object_finegrained_name'] = logo_name
+                    item['logo'] = {'name': logo_name, 'confidence': conf_val}
 
-    print('Unified Flag/Logo Recognition Done!')
+    print('Logo Recognition Done!')
+    return to_serializable(target)
+
+
+
+def flag_recognition(processor, model, idx_to_name, image, target, device, threshold=0.7, caption_api_url=None):
+    print('Start recognizing Flag (SigLIP2 + caption-api fallback).')
+    if len(target) == 0:
+        return to_serializable(target)
+
+    prompt = '请判断这是什么国家的旗帜，只输出国家英文名。'
+
+    for item in target:
+        item_image = crop_image(image, item['bbox'])
+        item_image = _resize_pil(item_image, resize_size=(224, 224))
+
+        inputs = processor(images=[item_image], return_tensors='pt')
+        pixel_values = inputs['pixel_values'].to(device)
+
+        with torch.no_grad():
+            logits, _ = model(pixel_values=pixel_values)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            conf_val = float(conf.item())
+            pred_idx = int(pred.item())
+
+        if conf_val >= float(threshold):
+            flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+            item['object_finegrained_name'] = flag_name
+            item['flag'] = {'name': flag_name, 'confidence': conf_val}
+        else:
+            if not caption_api_url:
+                flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+                item['object_finegrained_name'] = flag_name
+                item['flag'] = {'name': flag_name, 'confidence': conf_val}
+            else:
+                try:
+                    pred_text = call_caption_api(item_image, prompt=prompt, url=caption_api_url)
+                    pred_text = (pred_text or '').strip()
+                except Exception as e:
+                    print('caption-api failed:', e)
+                    pred_text = ''
+
+                if pred_text:
+                    item['object_finegrained_name'] = pred_text
+                    # Keep confidence numeric for frontend compatibility.
+                    item['flag'] = {'name': pred_text, 'confidence': conf_val}
+                else:
+                    flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
+                    item['object_finegrained_name'] = flag_name
+                    item['flag'] = {'name': flag_name, 'confidence': conf_val}
+
+    print('Flag Recognition Done!')
     return to_serializable(target)
         
 

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 import uvicorn
 from utils import load_image, load_model, get_grounding_output, postprocess_grounding_output, get_boxes, parse_label_confidence
-from utils import person_recognition, flower_bird_car_airplane_recognition, landmark_recognition
+from utils import person_recognition, logo_recognition, flower_bird_car_airplane_recognition, landmark_recognition, flag_recognition
 import os
 import pickle, json
 import torch
