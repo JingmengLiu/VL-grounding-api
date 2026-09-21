@@ -2,12 +2,11 @@ from fastapi import FastAPI, UploadFile, File, Form
 import uvicorn
 from utils import load_image, load_model, get_grounding_output, postprocess_grounding_output, to_serializable
 from utils import person_recognition, logo_recognition, flower_bird_car_airplane_recognition, landmark_recognition, flag_recognition
+from siglip2_two_mode_adapter import Siglip2TwoModeRecognizer
 import os
 import pickle, json
 import torch
-import torch.nn as nn
 from pathlib import Path
-from transformers import SiglipProcessor, AutoModel
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 
 app = FastAPI()
@@ -19,72 +18,16 @@ task_type_list = ['person', 'landmark', 'logo', 'flag', 'airplane', 'car', 'bird
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/home/liujingmeng/flag_logo/logo_flag_recognition"))
-
-# SigLIP2-based fine-grained recognizers (replacing old CLIP/flag classifier)
-SIGLIP2_MODEL = PROJECT_ROOT / "siglip2" / "model" / "siglip2"
-SIGLIP2_LOGO_BEST_MODEL = PROJECT_ROOT / "checkpoint" / "logo" / "siglip2_best_no_augment.pt"
-SIGLIP2_FLAG_BEST_MODEL = PROJECT_ROOT / "checkpoint" / "flag" / "siglip2_best.pt"
-
-LOGO_LABEL_JSON = PROJECT_ROOT / "datasets" / "logo" / "logo" / "Logo-2K+" / "Logo-2K+" / "Logo-2K+" / "label2idx.json"
-FLAG_LABEL_TXT = PROJECT_ROOT / "datasets" / "flags" / "flags" / "country-flags" / "class.txt"
-
-SIGLIP2_THRESHOLD = float(os.getenv("SIGLIP2_THRESHOLD", "0.7"))
+SIGLIP2_TWO_MODE_ROOT = Path(
+    os.getenv("SIGLIP2_TWO_MODE_ROOT", "/home/liujingmeng/flag_logo/siglip2_two_mode")
+)
+SIGLIP2_FLAG_SIMILARITY_THRESHOLD = float(
+    os.getenv("SIGLIP2_FLAG_SIMILARITY_THRESHOLD", "0.70")
+)
+SIGLIP2_LOGO_SIMILARITY_THRESHOLD = float(
+    os.getenv("SIGLIP2_LOGO_SIMILARITY_THRESHOLD", "0.70")
+)
 CAPTION_API_URL = os.getenv("CAPTION_API_URL", "http://127.0.0.1:8000/caption")
-
-
-class MultiTaskModel(nn.Module):
-    def __init__(self, model_name, num_labels):
-        super().__init__()
-        self.base = AutoModel.from_pretrained(model_name)
-        self.classifier = nn.Linear(self.base.config.vision_config.hidden_size, num_labels)
-
-    def forward(self, pixel_values, labels=None):
-        image_features = self.base.get_image_features(pixel_values=pixel_values)
-        logits = self.classifier(image_features)
-        loss = None
-        if labels is not None:
-            loss = nn.CrossEntropyLoss()(logits, labels)
-        return logits, loss
-
-
-def _infer_num_labels_from_ckpt(ckpt_state_dict: dict, fallback=1000) -> int:
-    num_labels = None
-    for k, v in ckpt_state_dict.items():
-        if "classifier.weight" in k or str(k).endswith("classifier.weight"):
-            num_labels = v.shape[0]
-            break
-    if num_labels is None:
-        for k, v in ckpt_state_dict.items():
-            if "classifier.bias" in k or str(k).endswith("classifier.bias"):
-                num_labels = v.shape[0]
-                break
-    return int(num_labels) if num_labels is not None else int(fallback)
-
-
-def _load_logo_label_map(label_json_path: Path):
-    with open(label_json_path, "r", encoding="utf-8") as f:
-        name_to_idx = json.load(f)
-    return {int(v): k for k, v in name_to_idx.items()}
-
-
-def _load_flag_label_map(label_txt_path: Path):
-    idx_to_name = {}
-    with open(label_txt_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            left = line.split("-", 1)[0].strip()  # e.g. "1. Afghanistan"
-            if "." in left:
-                num_str, eng_name = left.split(".", 1)
-                idx = int(num_str.strip()) - 1
-                eng_name = eng_name.strip()
-            else:
-                idx = len(idx_to_name)
-                eng_name = left
-            idx_to_name[idx] = eng_name
-    return idx_to_name
 
 def load_grounding_dino():
     print('Start loading GroundingDINO')
@@ -143,48 +86,15 @@ def load_landmark_model():
     return [model, model2], landmark_classes
 
 
-def load_logo_model():
-    print('Start loading Logo Module (SigLIP2).')
-
-    if not SIGLIP2_LOGO_BEST_MODEL.exists():
-        raise FileNotFoundError(f"Logo checkpoint not found: {SIGLIP2_LOGO_BEST_MODEL}")
-    if not LOGO_LABEL_JSON.exists():
-        raise FileNotFoundError(f"Logo label json not found: {LOGO_LABEL_JSON}")
-
-    processor = SiglipProcessor.from_pretrained(SIGLIP2_MODEL)
-    ckpt = torch.load(SIGLIP2_LOGO_BEST_MODEL, map_location="cpu")
-    num_labels = _infer_num_labels_from_ckpt(ckpt)
-    siglip2_model = MultiTaskModel(str(SIGLIP2_MODEL), num_labels).to(device)
-    state = torch.load(SIGLIP2_LOGO_BEST_MODEL, map_location=device)
-    siglip2_model.load_state_dict(state, strict=False)
-    siglip2_model.eval()
-
-    idx_to_name = _load_logo_label_map(LOGO_LABEL_JSON)
-
-    print('Logo Module loaded!')
-    return processor, siglip2_model, idx_to_name
-
-
-def load_flag_model():
-    print('Start loading Flag Module (SigLIP2).')
-
-    if not SIGLIP2_FLAG_BEST_MODEL.exists():
-        raise FileNotFoundError(f"Flag checkpoint not found: {SIGLIP2_FLAG_BEST_MODEL}")
-    if not FLAG_LABEL_TXT.exists():
-        raise FileNotFoundError(f"Flag label txt not found: {FLAG_LABEL_TXT}")
-
-    processor = SiglipProcessor.from_pretrained(SIGLIP2_MODEL)
-    ckpt = torch.load(SIGLIP2_FLAG_BEST_MODEL, map_location="cpu")
-    num_labels = _infer_num_labels_from_ckpt(ckpt)
-    siglip2_model = MultiTaskModel(str(SIGLIP2_MODEL), num_labels).to(device)
-    state = torch.load(SIGLIP2_FLAG_BEST_MODEL, map_location=device)
-    siglip2_model.load_state_dict(state, strict=False)
-    siglip2_model.eval()
-
-    idx_to_name = _load_flag_label_map(FLAG_LABEL_TXT)
-
-    print('Flag Module loaded!')
-    return processor, siglip2_model, idx_to_name
+def load_flag_logo_recognizer(enabled_modes):
+    print(f'Start loading Flag/Logo Module (SigLIP2 two-mode: {enabled_modes}).')
+    recognizer = Siglip2TwoModeRecognizer(
+        root=SIGLIP2_TWO_MODE_ROOT,
+        device=device,
+        enabled_modes=enabled_modes,
+    )
+    print('Flag/Logo Module loaded!')
+    return recognizer
 
 
 def load_flower_bird_car_airplane_model(model_type):
@@ -219,17 +129,19 @@ def load_flower_bird_car_airplane_transform():
 
 def load_all_models():
     model = load_grounding_dino()
-    models['detection'] = model    
+    models['detection'] = model
+    flag_logo_modes = [task for task in ('flag', 'logo') if task in task_type_list]
+    if flag_logo_modes:
+        models['flag_logo'] = load_flag_logo_recognizer(flag_logo_modes)
     fine_grained_transforms = load_flower_bird_car_airplane_transform()
     for task in task_type_list:
         if task == 'person':
             models[task] = load_face_model()
         elif task == 'landmark':
             models[task] = load_landmark_model()
-        elif task == 'logo':
-            models[task] = load_logo_model()
-        elif task == 'flag':
-            models[task] = load_flag_model()
+        elif task in ('logo', 'flag'):
+            # Both modes use the same encoder; the adapter selects the bank.
+            continue
         elif task == 'airplane':
             airplane_model = load_flower_bird_car_airplane_model('airplane')
             models[task] = [fine_grained_transforms] + list(airplane_model)
@@ -254,11 +166,15 @@ def return_task(task_type, image, fine_grained_list):
         landmark_model, landmark_classes = models[task_type]
         return landmark_recognition, (landmark_model, landmark_classes, image, fine_grained_list[task_type])
     elif task_type == 'logo':
-        processor, siglip2_model, idx_to_name = models[task_type]
-        return logo_recognition, (processor, siglip2_model, idx_to_name, image, fine_grained_list[task_type], device, SIGLIP2_THRESHOLD, CAPTION_API_URL)
+        return logo_recognition, (
+            models['flag_logo'], image, fine_grained_list[task_type],
+            SIGLIP2_LOGO_SIMILARITY_THRESHOLD, CAPTION_API_URL,
+        )
     elif task_type == 'flag':
-        processor, siglip2_model, idx_to_name = models[task_type]
-        return flag_recognition, (processor, siglip2_model, idx_to_name, image, fine_grained_list[task_type], device, SIGLIP2_THRESHOLD, CAPTION_API_URL)
+        return flag_recognition, (
+            models['flag_logo'], image, fine_grained_list[task_type],
+            SIGLIP2_FLAG_SIMILARITY_THRESHOLD, CAPTION_API_URL,
+        )
     elif task_type == 'airplane':
         fine_grained_transform, airplane_model, airplane_class_map = models[task_type]
         return flower_bird_car_airplane_recognition, ('airplane', airplane_model, fine_grained_transform, airplane_class_map, image, fine_grained_list[task_type], device)

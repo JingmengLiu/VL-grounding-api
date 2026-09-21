@@ -246,15 +246,6 @@ def crop_image(image, xyxys):
     return image.crop((x1, y1, x2, y2))  
 
 
-def _resize_pil(image_pil, resize_size=(224, 224)):
-    if resize_size is None:
-        return image_pil
-    size = (int(resize_size[0]), int(resize_size[1]))
-    if image_pil.size != size:
-        return image_pil.resize(size, Image.BICUBIC)
-    return image_pil
-
-
 def _extract_text_from_caption_response(resp_bytes: bytes, content_type: Optional[str]):
     text = resp_bytes.decode("utf-8", errors="ignore").strip()
     if content_type and "application/json" in content_type.lower():
@@ -402,36 +393,47 @@ def person_recognition_old(resnet, mtcnn, embedding_dict, image, target, device)
     return to_serializable(target)
  
 
-def logo_recognition(processor, model, idx_to_name, image, target, device, threshold=0.7, caption_api_url=None):
-    print('Start recognizing Logo (SigLIP2 + caption-api fallback).')
+def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, caption_api_url=None):
+    """Recognize top-1 flag/logo by cosine similarity, with caption fallback."""
+    if mode not in ('flag', 'logo'):
+        raise ValueError(f'Unsupported flag/logo mode: {mode}')
+
+    print(f'Start recognizing {mode.capitalize()} (SigLIP2 two-mode + caption-api fallback).')
     if len(target) == 0:
         return to_serializable(target)
 
-    prompt = '请判断这是什么公司或组织，只输出英文名。'
+    prompts = {
+        'logo': '请判断这是什么公司或组织，只输出英文名。',
+        'flag': '请判断这是什么国家的旗帜，只输出国家英文名。',
+    }
+    prompt = prompts[mode]
 
     for item in target:
         item_image = crop_image(image, item['bbox'])
-        item_image = _resize_pil(item_image, resize_size=(224, 224))
+        prediction = recognizer.predict(item_image, mode=mode)
+        predicted_name = prediction['class_name']
+        similarity = float(prediction['similarity'])
 
-        inputs = processor(images=[item_image], return_tensors='pt')
-        pixel_values = inputs['pixel_values'].to(device)
+        result_info = {
+            'name': predicted_name,
+            # Keep the existing frontend field; its value is now cosine similarity.
+            'confidence': similarity,
+            'similarity': similarity,
+            'score_type': 'cosine_similarity',
+            'siglip2_class_key': prediction['class_key'],
+            'siglip2_source_category': prediction['source_category'],
+            'recognition_source': 'siglip2_two_mode',
+        }
+        if prediction.get('qid'):
+            result_info['siglip2_qid'] = prediction['qid']
 
-        with torch.no_grad():
-            logits, _ = model(pixel_values=pixel_values)
-            probs = torch.softmax(logits, dim=1)
-            conf, pred = probs.max(dim=1)
-            conf_val = float(conf.item())
-            pred_idx = int(pred.item())
-
-        if conf_val >= float(threshold):
-            logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-            item['object_finegrained_name'] = logo_name
-            item['logo'] = {'name': logo_name, 'confidence': conf_val}
+        if similarity >= float(threshold):
+            item['object_finegrained_name'] = predicted_name
+            item[mode] = result_info
         else:
             if not caption_api_url:
-                logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-                item['object_finegrained_name'] = logo_name
-                item['logo'] = {'name': logo_name, 'confidence': conf_val}
+                item['object_finegrained_name'] = predicted_name
+                item[mode] = result_info
             else:
                 try:
                     pred_text = call_caption_api(item_image, prompt=prompt, url=caption_api_url)
@@ -442,67 +444,30 @@ def logo_recognition(processor, model, idx_to_name, image, target, device, thres
 
                 if pred_text:
                     item['object_finegrained_name'] = pred_text
-                    # Keep confidence numeric for frontend compatibility.
-                    item['logo'] = {'name': pred_text, 'confidence': conf_val}
+                    item[mode] = {
+                        **result_info,
+                        'name': pred_text,
+                        'recognition_source': 'caption_fallback',
+                        'siglip2_top1_name': predicted_name,
+                    }
                 else:
-                    logo_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-                    item['object_finegrained_name'] = logo_name
-                    item['logo'] = {'name': logo_name, 'confidence': conf_val}
+                    item['object_finegrained_name'] = predicted_name
+                    item[mode] = result_info
 
-    print('Logo Recognition Done!')
+    print(f'{mode.capitalize()} Recognition Done!')
     return to_serializable(target)
 
 
+def logo_recognition(recognizer, image, target, threshold=0.7, caption_api_url=None):
+    return flag_logo_recognition(
+        recognizer, 'logo', image, target, threshold, caption_api_url
+    )
 
-def flag_recognition(processor, model, idx_to_name, image, target, device, threshold=0.7, caption_api_url=None):
-    print('Start recognizing Flag (SigLIP2 + caption-api fallback).')
-    if len(target) == 0:
-        return to_serializable(target)
 
-    prompt = '请判断这是什么国家的旗帜，只输出国家英文名。'
-
-    for item in target:
-        item_image = crop_image(image, item['bbox'])
-        item_image = _resize_pil(item_image, resize_size=(224, 224))
-
-        inputs = processor(images=[item_image], return_tensors='pt')
-        pixel_values = inputs['pixel_values'].to(device)
-
-        with torch.no_grad():
-            logits, _ = model(pixel_values=pixel_values)
-            probs = torch.softmax(logits, dim=1)
-            conf, pred = probs.max(dim=1)
-            conf_val = float(conf.item())
-            pred_idx = int(pred.item())
-
-        if conf_val >= float(threshold):
-            flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-            item['object_finegrained_name'] = flag_name
-            item['flag'] = {'name': flag_name, 'confidence': conf_val}
-        else:
-            if not caption_api_url:
-                flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-                item['object_finegrained_name'] = flag_name
-                item['flag'] = {'name': flag_name, 'confidence': conf_val}
-            else:
-                try:
-                    pred_text = call_caption_api(item_image, prompt=prompt, url=caption_api_url)
-                    pred_text = (pred_text or '').strip()
-                except Exception as e:
-                    print('caption-api failed:', e)
-                    pred_text = ''
-
-                if pred_text:
-                    item['object_finegrained_name'] = pred_text
-                    # Keep confidence numeric for frontend compatibility.
-                    item['flag'] = {'name': pred_text, 'confidence': conf_val}
-                else:
-                    flag_name = idx_to_name.get(pred_idx, f"Unknown_{pred_idx}")
-                    item['object_finegrained_name'] = flag_name
-                    item['flag'] = {'name': flag_name, 'confidence': conf_val}
-
-    print('Flag Recognition Done!')
-    return to_serializable(target)
+def flag_recognition(recognizer, image, target, threshold=0.7, caption_api_url=None):
+    return flag_logo_recognition(
+        recognizer, 'flag', image, target, threshold, caption_api_url
+    )
         
 
 def flower_bird_car_airplane_recognition(model_type, model, data_transform, class_map, image, target, device):

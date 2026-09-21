@@ -4,6 +4,30 @@
 
 # :sauropod: Grounding DINO 
 
+## Packaged SigLIP2 flag/logo recognition
+
+The `flag` and `logo` fine-grained tasks share one packaged SigLIP2 encoder and
+use separate retrieval banks. The deployment package defaults to:
+
+```text
+/home/liujingmeng/flag_logo/siglip2_two_mode
+```
+
+Override its location and similarity thresholds with environment variables:
+
+```bash
+export SIGLIP2_TWO_MODE_ROOT=/home/liujingmeng/flag_logo/siglip2_two_mode
+export SIGLIP2_FLAG_SIMILARITY_THRESHOLD=0.70
+export SIGLIP2_LOGO_SIMILARITY_THRESHOLD=0.70
+export CAPTION_API_URL=http://127.0.0.1:8000/caption
+```
+
+Only the top-1 result is used. Its cosine `similarity` is compared with the
+mode-specific threshold. Results below the threshold continue to use the
+existing multimodal caption fallback. The response retains the historical
+`confidence` field for frontend compatibility, but its value is now the cosine
+similarity and `score_type` is `cosine_similarity`.
+
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-mscoco)](https://paperswithcode.com/sota/zero-shot-object-detection-on-mscoco?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-odinw)](https://paperswithcode.com/sota/zero-shot-object-detection-on-odinw?p=grounding-dino-marrying-dino-with-grounded) \
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco-minival)](https://paperswithcode.com/sota/object-detection-on-coco-minival?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco)](https://paperswithcode.com/sota/object-detection-on-coco?p=grounding-dino-marrying-dino-with-grounded)
 
@@ -364,7 +388,6 @@ If you find our work helpful for your research, please consider citing the follo
   year={2023}
 }
 ```
-
 
 
 
