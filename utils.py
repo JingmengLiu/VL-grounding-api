@@ -408,6 +408,13 @@ def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, captio
     }
     prompt = prompts[mode]
 
+    source_metadata = {
+        'flags': ('Flag', 'country-flags-in-the-wild'),
+        'Logo': ('Logo', 'Logo-2K+'),
+        'Party': ('Party', 'Party'),
+        'Organization': ('Organization', 'Organization'),
+    }
+
     for item in target:
         item_image = crop_image(image, item['bbox'])
         prediction = recognizer.predict(item_image, mode=mode)
@@ -429,6 +436,15 @@ def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, captio
 
         if similarity >= float(threshold):
             item['object_finegrained_name'] = predicted_name
+            source_category = prediction['source_category']
+            entity_metadata = source_metadata.get(source_category)
+            if entity_metadata:
+                entity_type, dataset = entity_metadata
+                item['object_finegrained_type'] = entity_type
+                item['object_finegrained_dataset'] = dataset
+                # All packaged bank IDs match the corresponding Source_ID:
+                # numeric Logo/Flag IDs and Wikidata QIDs for Party/Organization.
+                item['object_finegrained_id'] = str(prediction['id'])
             item[mode] = result_info
         else:
             if not caption_api_url:
