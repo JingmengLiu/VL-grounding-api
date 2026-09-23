@@ -546,20 +546,20 @@ def _fuse_flag_logo_results(
 
     if siglip_strong and vlm_strong:
         return {
-            'accepted': False,
-            'decision': 'model_conflict',
-            'source': 'rejected',
-            'name': None,
+            'accepted': True,
+            'decision': 'both_high_vlm_selected',
+            'source': 'vlm',
+            'name': vlm_name,
             'candidate': None,
-            'confidence_level': 'low',
+            'confidence_level': 'high',
         }
 
     return {
-        'accepted': False,
-        'decision': 'low_confidence',
-        'source': 'rejected',
-        'name': None,
-        'candidate': None,
+        'accepted': True,
+        'decision': 'both_low_siglip_selected',
+        'source': 'siglip2_two_mode',
+        'name': top1['class_name'],
+        'candidate': top1,
         'confidence_level': 'low',
     }
 

@@ -29,19 +29,18 @@ export CAPTION_API_URL=http://127.0.0.1:8000/caption
 For each detected flag/logo crop, SigLIP2 retrieval and the multimodal caption
 service run concurrently. SigLIP2 returns the configured top-k candidates;
 the multimodal service independently returns a structured symbol type, name,
-confidence, and whether the symbol is entity-specific or generic. Conservative
-fusion rules accept agreement or one clearly strong result, while conflicting
-or low-confidence predictions are rejected instead of being forced into an
-entity class. This prevents a generic coat of arms from being mapped to a
-specific agency merely because that image appeared on the agency's Wikipedia
-page.
+confidence, and whether the symbol is entity-specific or generic. Fusion rules
+accept agreement or one clearly strong result. If both models are highly
+confident but disagree, the multimodal result wins; if both are below their
+strong thresholds, the SigLIP2 top-1 result is retained instead of returning
+null. A high-confidence generic coat-of-arms judgement can still override a
+weak organization match.
 
 The response remains backward compatible: accepted entity-level results still
 populate `object_finegrained_*`, and the historical `confidence` field remains
 the SigLIP2 cosine similarity. Diagnostics are available under both the task
 key (`flag` or `logo`) and `flag_logo_fusion`, including `siglip2_top_k`, `vlm`,
-`decision`, and `accepted`. A rejected result keeps the GroundingDINO box but
-does not populate a fine-grained entity name or ID.
+`decision`, and `accepted`.
 
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-mscoco)](https://paperswithcode.com/sota/zero-shot-object-detection-on-mscoco?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-odinw)](https://paperswithcode.com/sota/zero-shot-object-detection-on-odinw?p=grounding-dino-marrying-dino-with-grounded) \
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco-minival)](https://paperswithcode.com/sota/object-detection-on-coco-minival?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco)](https://paperswithcode.com/sota/object-detection-on-coco?p=grounding-dino-marrying-dino-with-grounded)
@@ -403,5 +402,4 @@ If you find our work helpful for your research, please consider citing the follo
   year={2023}
 }
 ```
-
 
