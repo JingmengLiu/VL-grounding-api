@@ -14,6 +14,7 @@ import urllib.error
 import io
 import uuid
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from torchvision.ops import nms
 import cv2
@@ -393,20 +394,195 @@ def person_recognition_old(resnet, mtcnn, embedding_dict, image, target, device)
     return to_serializable(target)
  
 
-def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, caption_api_url=None):
-    """Recognize top-1 flag/logo by cosine similarity, with caption fallback."""
+def _normalize_entity_name(value):
+    value = re.sub(r'[^a-z0-9]+', ' ', str(value or '').lower())
+    return ' '.join(value.split())
+
+
+def _parse_flag_logo_vlm_result(raw_text):
+    """Parse the structured VLM answer; tolerate fenced JSON and plain text."""
+    text = (raw_text or '').strip()
+    if not text:
+        return {
+            'symbol_type': 'unknown', 'name': 'unknown', 'confidence': 0.0,
+            'specificity': 'unknown', 'matched_candidate': None,
+        }
+
+    fenced = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, flags=re.I | re.S)
+    json_text = fenced.group(1) if fenced else text
+    if not fenced:
+        object_match = re.search(r'\{.*\}', text, flags=re.S)
+        if object_match:
+            json_text = object_match.group(0)
+
+    try:
+        value = json.loads(json_text)
+    except (TypeError, ValueError):
+        # Compatibility with a caption service that still returns one name.
+        return {
+            'symbol_type': 'unknown', 'name': text, 'confidence': 0.5,
+            'specificity': 'unknown', 'matched_candidate': None,
+            'parse_fallback': True,
+        }
+
+    if not isinstance(value, dict):
+        value = {}
+    try:
+        confidence = min(1.0, max(0.0, float(value.get('confidence', 0.0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    specificity = str(value.get('specificity') or 'unknown').strip().lower()
+    if specificity not in {'specific', 'generic', 'unknown'}:
+        specificity = 'unknown'
+    return {
+        'symbol_type': str(value.get('symbol_type') or 'unknown').strip().lower(),
+        'name': str(value.get('name') or 'unknown').strip(),
+        'confidence': confidence,
+        'specificity': specificity,
+        'matched_candidate': value.get('matched_candidate'),
+    }
+
+
+def _build_flag_logo_vlm_prompt(mode, candidates):
+    candidate_lines = '\n'.join(
+        f"{index}. {candidate['class_name']}"
+        for index, candidate in enumerate(candidates, start=1)
+    ) or '（无候选信息，请独立判断）'
+    requested_kind = '旗帜' if mode == 'flag' else '标志、徽章或印章'
+    return f"""请识别裁剪图像中的{requested_kind}。候选结果如下：
+{candidate_lines}
+
+请独立观察图像，不要因为候选中存在某个名称就强行选择。若图像只是国家国徽、国旗、通用政府徽章或印章，不得推断为某个具体政府机构。无法可靠判断时返回 unknown。未提供候选时，matched_candidate 必须为 null。
+
+只输出一个 JSON 对象，不要输出解释或 Markdown：
+{{
+  "symbol_type": "flag|logo|coat_of_arms|seal|party_symbol|organization_symbol|unknown",
+  "name": "英文名称或unknown",
+  "confidence": 0.0,
+  "specificity": "specific|generic|unknown",
+  "matched_candidate": "与候选完全对应时填写候选英文名称，否则为null"
+}}"""
+
+
+def _find_vlm_candidate(vlm_result, candidates):
+    requested = vlm_result.get('matched_candidate') or vlm_result.get('name')
+    normalized = _normalize_entity_name(requested)
+    if not normalized:
+        return None
+    return next(
+        (candidate for candidate in candidates
+         if _normalize_entity_name(candidate.get('class_name')) == normalized),
+        None,
+    )
+
+
+def _fuse_flag_logo_results(
+    prediction,
+    vlm_result,
+    siglip_strong_threshold,
+    siglip_weak_threshold,
+    vlm_strong_threshold,
+    vlm_weak_threshold,
+):
+    """Fuse incomparable model scores with conservative, explainable rules."""
+    candidates = prediction.get('top_k') or [prediction]
+    top1 = candidates[0]
+    similarity = float(top1['similarity'])
+    vlm_confidence = float(vlm_result.get('confidence', 0.0))
+    vlm_name = str(vlm_result.get('name') or 'unknown').strip()
+    vlm_unknown = _normalize_entity_name(vlm_name) in {'', 'unknown', 'none', 'null'}
+    matched_candidate = _find_vlm_candidate(vlm_result, candidates)
+    generic_symbol = (
+        vlm_result.get('specificity') == 'generic'
+        or vlm_result.get('symbol_type') in {'coat_of_arms', 'seal'}
+    )
+
+    if matched_candidate and (
+        float(matched_candidate['similarity']) >= siglip_weak_threshold
+        or vlm_confidence >= vlm_weak_threshold
+    ):
+        return {
+            'accepted': True,
+            'decision': 'model_agreement',
+            'source': 'siglip_vlm_agreement',
+            'name': matched_candidate['class_name'],
+            'candidate': matched_candidate,
+            'confidence_level': 'high',
+        }
+
+    if generic_symbol and not vlm_unknown and vlm_confidence >= vlm_strong_threshold \
+            and similarity < siglip_strong_threshold:
+        return {
+            'accepted': True,
+            'decision': 'vlm_generic_override',
+            'source': 'vlm',
+            'name': vlm_name,
+            'candidate': None,
+            'confidence_level': 'high',
+        }
+
+    siglip_strong = similarity >= siglip_strong_threshold
+    vlm_strong = vlm_confidence >= vlm_strong_threshold and not vlm_unknown
+
+    if siglip_strong and not vlm_strong:
+        return {
+            'accepted': True,
+            'decision': 'siglip_strong',
+            'source': 'siglip2_two_mode',
+            'name': top1['class_name'],
+            'candidate': top1,
+            'confidence_level': 'high',
+        }
+
+    if vlm_strong and similarity < siglip_strong_threshold:
+        return {
+            'accepted': True,
+            'decision': 'vlm_strong',
+            'source': 'vlm',
+            'name': vlm_name,
+            'candidate': None,
+            'confidence_level': 'high',
+        }
+
+    if siglip_strong and vlm_strong:
+        return {
+            'accepted': False,
+            'decision': 'model_conflict',
+            'source': 'rejected',
+            'name': None,
+            'candidate': None,
+            'confidence_level': 'low',
+        }
+
+    return {
+        'accepted': False,
+        'decision': 'low_confidence',
+        'source': 'rejected',
+        'name': None,
+        'candidate': None,
+        'confidence_level': 'low',
+    }
+
+
+def flag_logo_recognition(
+    recognizer,
+    mode,
+    image,
+    target,
+    siglip_strong_threshold=0.75,
+    caption_api_url=None,
+    siglip_weak_threshold=0.60,
+    vlm_strong_threshold=0.80,
+    vlm_weak_threshold=0.60,
+    top_k=3,
+):
+    """Recognize flag/logo crops with parallel SigLIP2 and VLM inference."""
     if mode not in ('flag', 'logo'):
         raise ValueError(f'Unsupported flag/logo mode: {mode}')
 
-    print(f'Start recognizing {mode.capitalize()} (SigLIP2 two-mode + caption-api fallback).')
+    print(f'Start recognizing {mode.capitalize()} (SigLIP2 + VLM fusion).')
     if len(target) == 0:
         return to_serializable(target)
-
-    prompts = {
-        'logo': '请判断这是什么公司或组织，只输出英文名。',
-        'flag': '请判断这是什么国家的旗帜，只输出国家英文名。',
-    }
-    prompt = prompts[mode]
 
     source_metadata = {
         'flags': ('Flag', 'country-flags-in-the-wild'),
@@ -417,26 +593,65 @@ def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, captio
 
     for item in target:
         item_image = crop_image(image, item['bbox'])
-        prediction = recognizer.predict(item_image, mode=mode)
-        predicted_name = prediction['class_name']
-        similarity = float(prediction['similarity'])
-
-        result_info = {
-            'name': predicted_name,
-            # Keep the existing frontend field; its value is now cosine similarity.
-            'confidence': similarity,
-            'similarity': similarity,
-            'score_type': 'cosine_similarity',
-            'siglip2_class_key': prediction['class_key'],
-            'siglip2_source_category': prediction['source_category'],
-            'recognition_source': 'siglip2_two_mode',
+        prompt = _build_flag_logo_vlm_prompt(mode, [])
+        vlm_result = {
+            'symbol_type': 'unknown', 'name': 'unknown', 'confidence': 0.0,
+            'specificity': 'unknown', 'matched_candidate': None,
+            'available': False,
         }
-        if prediction.get('qid'):
-            result_info['siglip2_qid'] = prediction['qid']
+        # Run the independent visual judgements concurrently. The VLM does not
+        # see the retrieval result, which avoids candidate anchoring.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            siglip_future = executor.submit(recognizer.predict, item_image, mode, top_k)
+            vlm_future = None
+            if caption_api_url:
+                vlm_future = executor.submit(
+                    call_caption_api, item_image, prompt, caption_api_url
+                )
+            prediction = siglip_future.result()
+            if vlm_future:
+                try:
+                    raw_vlm_result = vlm_future.result()
+                    vlm_result = {**_parse_flag_logo_vlm_result(raw_vlm_result), 'available': True}
+                except Exception as e:
+                    print('caption-api failed:', e)
+                    vlm_result['error'] = str(e)
 
-        if similarity >= float(threshold):
-            item['object_finegrained_name'] = predicted_name
-            source_category = prediction['source_category']
+        candidates = prediction.get('top_k') or [prediction]
+
+        decision = _fuse_flag_logo_results(
+            prediction,
+            vlm_result,
+            float(siglip_strong_threshold),
+            float(siglip_weak_threshold),
+            float(vlm_strong_threshold),
+            float(vlm_weak_threshold),
+        )
+
+        top1 = candidates[0]
+        result_info = {
+            'name': decision['name'],
+            'confidence': float(top1['similarity']),
+            'similarity': float(top1['similarity']),
+            'score_type': 'cosine_similarity',
+            'siglip2_class_key': top1['class_key'],
+            'siglip2_source_category': top1['source_category'],
+            'siglip2_top_k': candidates,
+            'vlm': vlm_result,
+            'recognition_source': decision['source'],
+            'decision': decision['decision'],
+            'accepted': decision['accepted'],
+            'final_confidence_level': decision['confidence_level'],
+        }
+        if top1.get('qid'):
+            result_info['siglip2_qid'] = top1['qid']
+        item[mode] = result_info
+        item['flag_logo_fusion'] = result_info
+
+        if decision['accepted']:
+            item['object_finegrained_name'] = decision['name']
+            candidate = decision.get('candidate')
+            source_category = candidate.get('source_category') if candidate else None
             entity_metadata = source_metadata.get(source_category)
             if entity_metadata:
                 entity_type, dataset = entity_metadata
@@ -444,45 +659,21 @@ def flag_logo_recognition(recognizer, mode, image, target, threshold=0.7, captio
                 item['object_finegrained_dataset'] = dataset
                 # All packaged bank IDs match the corresponding Source_ID:
                 # numeric Logo/Flag IDs and Wikidata QIDs for Party/Organization.
-                item['object_finegrained_id'] = str(prediction['id'])
-            item[mode] = result_info
-        else:
-            if not caption_api_url:
-                item['object_finegrained_name'] = predicted_name
-                item[mode] = result_info
-            else:
-                try:
-                    pred_text = call_caption_api(item_image, prompt=prompt, url=caption_api_url)
-                    pred_text = (pred_text or '').strip()
-                except Exception as e:
-                    print('caption-api failed:', e)
-                    pred_text = ''
-
-                if pred_text:
-                    item['object_finegrained_name'] = pred_text
-                    item[mode] = {
-                        **result_info,
-                        'name': pred_text,
-                        'recognition_source': 'caption_fallback',
-                        'siglip2_top1_name': predicted_name,
-                    }
-                else:
-                    item['object_finegrained_name'] = predicted_name
-                    item[mode] = result_info
+                item['object_finegrained_id'] = str(candidate['id'])
 
     print(f'{mode.capitalize()} Recognition Done!')
     return to_serializable(target)
 
 
-def logo_recognition(recognizer, image, target, threshold=0.7, caption_api_url=None):
+def logo_recognition(recognizer, image, target, *fusion_args):
     return flag_logo_recognition(
-        recognizer, 'logo', image, target, threshold, caption_api_url
+        recognizer, 'logo', image, target, *fusion_args
     )
 
 
-def flag_recognition(recognizer, image, target, threshold=0.7, caption_api_url=None):
+def flag_recognition(recognizer, image, target, *fusion_args):
     return flag_logo_recognition(
-        recognizer, 'flag', image, target, threshold, caption_api_url
+        recognizer, 'flag', image, target, *fusion_args
     )
         
 

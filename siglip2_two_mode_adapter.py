@@ -84,8 +84,8 @@ class Siglip2TwoModeRecognizer:
         }
 
     @torch.inference_mode()
-    def predict(self, image: Image.Image, mode: str) -> dict:
-        """Return the top-1 class and its raw cosine similarity."""
+    def predict(self, image: Image.Image, mode: str, top_k: int = 1) -> dict:
+        """Return the top class plus a ranked list of cosine-similarity matches."""
         mode = str(mode).lower()
         if mode not in self.banks:
             raise ValueError(f"SigLIP2 mode is not loaded: {mode}")
@@ -116,8 +116,29 @@ class Siglip2TwoModeRecognizer:
         query = F.normalize(features[0].float(), dim=0).cpu()
         bank = self.banks[mode]
         similarities = bank["vectors"] @ query
-        similarity, position = similarities.max(dim=0)
-        class_info = bank["classes"][int(position.item())]
+        requested_top_k = max(1, int(top_k))
+        actual_top_k = min(requested_top_k, int(similarities.numel()))
+        top_similarities, top_positions = similarities.topk(actual_top_k)
+
+        def build_match(position: int, similarity: float) -> dict:
+            class_info = bank["classes"][position]
+            match = {
+                "id": class_info["id"],
+                "class_key": class_info["class_key"],
+                "source_category": class_info["source_category"],
+                "class_name": class_info["class_name"],
+                "category": class_info["category"],
+                "similarity": similarity,
+            }
+            if class_info.get("qid"):
+                match["qid"] = class_info["qid"]
+            return match
+
+        matches = [
+            build_match(int(position.item()), float(similarity.item()))
+            for similarity, position in zip(top_similarities, top_positions)
+        ]
+        class_info = matches[0]
 
         result = {
             "id": class_info["id"],
@@ -125,8 +146,9 @@ class Siglip2TwoModeRecognizer:
             "source_category": class_info["source_category"],
             "class_name": class_info["class_name"],
             "category": class_info["category"],
-            "similarity": float(similarity.item()),
+            "similarity": class_info["similarity"],
             "score_type": "cosine_similarity",
+            "top_k": matches,
         }
         if class_info.get("qid"):
             result["qid"] = class_info["qid"]

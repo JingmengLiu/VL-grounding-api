@@ -22,11 +22,21 @@ SIGLIP2_TWO_MODE_ROOT = Path(
     os.getenv("SIGLIP2_TWO_MODE_ROOT", "/home/liujingmeng/flag_logo/siglip2_two_mode")
 )
 SIGLIP2_FLAG_SIMILARITY_THRESHOLD = float(
-    os.getenv("SIGLIP2_FLAG_SIMILARITY_THRESHOLD", "0.70")
+    os.getenv("SIGLIP2_FLAG_SIMILARITY_THRESHOLD", "0.75")
 )
 SIGLIP2_LOGO_SIMILARITY_THRESHOLD = float(
-    os.getenv("SIGLIP2_LOGO_SIMILARITY_THRESHOLD", "0.70")
+    os.getenv("SIGLIP2_LOGO_SIMILARITY_THRESHOLD", "0.75")
 )
+SIGLIP2_WEAK_SIMILARITY_THRESHOLD = float(
+    os.getenv("SIGLIP2_WEAK_SIMILARITY_THRESHOLD", "0.60")
+)
+FLAG_LOGO_VLM_CONFIDENCE_THRESHOLD = float(
+    os.getenv("FLAG_LOGO_VLM_CONFIDENCE_THRESHOLD", "0.80")
+)
+FLAG_LOGO_VLM_WEAK_CONFIDENCE_THRESHOLD = float(
+    os.getenv("FLAG_LOGO_VLM_WEAK_CONFIDENCE_THRESHOLD", "0.60")
+)
+FLAG_LOGO_TOP_K = int(os.getenv("FLAG_LOGO_TOP_K", "3"))
 CAPTION_API_URL = os.getenv("CAPTION_API_URL", "http://127.0.0.1:8000/caption")
 
 def load_grounding_dino():
@@ -169,11 +179,19 @@ def return_task(task_type, image, fine_grained_list):
         return logo_recognition, (
             models['flag_logo'], image, fine_grained_list[task_type],
             SIGLIP2_LOGO_SIMILARITY_THRESHOLD, CAPTION_API_URL,
+            SIGLIP2_WEAK_SIMILARITY_THRESHOLD,
+            FLAG_LOGO_VLM_CONFIDENCE_THRESHOLD,
+            FLAG_LOGO_VLM_WEAK_CONFIDENCE_THRESHOLD,
+            FLAG_LOGO_TOP_K,
         )
     elif task_type == 'flag':
         return flag_recognition, (
             models['flag_logo'], image, fine_grained_list[task_type],
             SIGLIP2_FLAG_SIMILARITY_THRESHOLD, CAPTION_API_URL,
+            SIGLIP2_WEAK_SIMILARITY_THRESHOLD,
+            FLAG_LOGO_VLM_CONFIDENCE_THRESHOLD,
+            FLAG_LOGO_VLM_WEAK_CONFIDENCE_THRESHOLD,
+            FLAG_LOGO_TOP_K,
         )
     elif task_type == 'airplane':
         fine_grained_transform, airplane_model, airplane_class_map = models[task_type]
