@@ -399,12 +399,43 @@ def _normalize_entity_name(value):
     return ' '.join(value.split())
 
 
+def _canonicalize_flag_logo_name(value, symbol_type=None):
+    """Remove visual-symbol wrappers while preserving the entity's display name."""
+    name = str(value or '').strip().strip('"\'`').strip()
+    name = re.sub(r'[\s\u00a0]+', ' ', name)
+    name = re.sub(r'[\s.,;:!?]+$', '', name).strip()
+    if _normalize_entity_name(name) in {'', 'unknown', 'none', 'null'}:
+        return 'unknown'
+
+    symbol_phrases = (
+        r'coat\s+of\s+arms|party\s+symbol|organization\s+symbol|'
+        r'national\s+flag|official\s+flag|official\s+logo|'
+        r'flag|logo|emblem|seal|symbol'
+    )
+    prefix_patterns = (
+        rf'^(?:the\s+)?(?:{symbol_phrases})\s+of\s+(?:the\s+)?(.+)$',
+        rf'^(?:the\s+)?(?:{symbol_phrases})\s+for\s+(?:the\s+)?(.+)$',
+    )
+    for pattern in prefix_patterns:
+        match = re.match(pattern, name, flags=re.I)
+        if match:
+            return match.group(1).strip()
+
+    suffix_match = re.match(
+        rf'^(.+?)\s+(?:{symbol_phrases})$', name, flags=re.I
+    )
+    if suffix_match:
+        return suffix_match.group(1).strip()
+
+    return name
+
+
 def _parse_flag_logo_vlm_result(raw_text):
     """Parse the structured VLM answer; tolerate fenced JSON and plain text."""
     text = (raw_text or '').strip()
     if not text:
         return {
-            'symbol_type': 'unknown', 'name': 'unknown', 'confidence': 0.0,
+            'symbol_type': 'unknown', 'raw_name': '', 'name': 'unknown', 'confidence': 0.0,
             'specificity': 'unknown', 'matched_candidate': None,
         }
 
@@ -420,7 +451,8 @@ def _parse_flag_logo_vlm_result(raw_text):
     except (TypeError, ValueError):
         # Compatibility with a caption service that still returns one name.
         return {
-            'symbol_type': 'unknown', 'name': text, 'confidence': 0.5,
+            'symbol_type': 'unknown', 'raw_name': text,
+            'name': _canonicalize_flag_logo_name(text), 'confidence': 0.5,
             'specificity': 'unknown', 'matched_candidate': None,
             'parse_fallback': True,
         }
@@ -434,9 +466,12 @@ def _parse_flag_logo_vlm_result(raw_text):
     specificity = str(value.get('specificity') or 'unknown').strip().lower()
     if specificity not in {'specific', 'generic', 'unknown'}:
         specificity = 'unknown'
+    symbol_type = str(value.get('symbol_type') or 'unknown').strip().lower()
+    raw_name = str(value.get('name') or 'unknown').strip()
     return {
-        'symbol_type': str(value.get('symbol_type') or 'unknown').strip().lower(),
-        'name': str(value.get('name') or 'unknown').strip(),
+        'symbol_type': symbol_type,
+        'raw_name': raw_name,
+        'name': _canonicalize_flag_logo_name(raw_name, symbol_type),
         'confidence': confidence,
         'specificity': specificity,
         'matched_candidate': value.get('matched_candidate'),
@@ -454,6 +489,8 @@ def _build_flag_logo_vlm_prompt(mode, candidates):
 
 请独立观察图像，不要因为候选中存在某个名称就强行选择。若图像只是国家国徽、国旗、通用政府徽章或印章，不得推断为某个具体政府机构。无法可靠判断时返回 unknown。未提供候选时，matched_candidate 必须为 null。
 
+name 只能填写实体本身的简短英文名称，不得包含 flag of、logo of、coat of arms of、emblem of、seal of、symbol of、official logo 等描述性前后缀。例如美国旗帜填写 United States，俄罗斯国徽填写 Russian，Indian National Congress 的标志填写 Indian National Congress。符号类别只通过 symbol_type 表达。
+
 只输出一个 JSON 对象，不要输出解释或 Markdown：
 {{
   "symbol_type": "flag|logo|coat_of_arms|seal|party_symbol|organization_symbol|unknown",
@@ -466,12 +503,18 @@ def _build_flag_logo_vlm_prompt(mode, candidates):
 
 def _find_vlm_candidate(vlm_result, candidates):
     requested = vlm_result.get('matched_candidate') or vlm_result.get('name')
-    normalized = _normalize_entity_name(requested)
+    normalized = _normalize_entity_name(
+        _canonicalize_flag_logo_name(requested, vlm_result.get('symbol_type'))
+    )
     if not normalized:
         return None
     return next(
         (candidate for candidate in candidates
-         if _normalize_entity_name(candidate.get('class_name')) == normalized),
+         if _normalize_entity_name(
+             _canonicalize_flag_logo_name(
+                 candidate.get('class_name'), vlm_result.get('symbol_type')
+             )
+         ) == normalized),
         None,
     )
 
@@ -595,7 +638,7 @@ def flag_logo_recognition(
         item_image = crop_image(image, item['bbox'])
         prompt = _build_flag_logo_vlm_prompt(mode, [])
         vlm_result = {
-            'symbol_type': 'unknown', 'name': 'unknown', 'confidence': 0.0,
+            'symbol_type': 'unknown', 'raw_name': '', 'name': 'unknown', 'confidence': 0.0,
             'specificity': 'unknown', 'matched_candidate': None,
             'available': False,
         }

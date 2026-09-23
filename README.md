@@ -42,6 +42,12 @@ the SigLIP2 cosine similarity. Diagnostics are available under both the task
 key (`flag` or `logo`) and `flag_logo_fusion`, including `siglip2_top_k`, `vlm`,
 `decision`, and `accepted`.
 
+The VLM is instructed to return entity-only names (`United States`, not
+`Flag of the United States`). The service also normalizes common flag, logo,
+emblem, seal, symbol, and coat-of-arms wrappers before candidate matching. The
+unmodified model text is retained as `vlm.raw_name`, while the normalized
+`vlm.name` is used for fusion and frontend display.
+
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-mscoco)](https://paperswithcode.com/sota/zero-shot-object-detection-on-mscoco?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/zero-shot-object-detection-on-odinw)](https://paperswithcode.com/sota/zero-shot-object-detection-on-odinw?p=grounding-dino-marrying-dino-with-grounded) \
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco-minival)](https://paperswithcode.com/sota/object-detection-on-coco-minival?p=grounding-dino-marrying-dino-with-grounded) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/grounding-dino-marrying-dino-with-grounded/object-detection-on-coco)](https://paperswithcode.com/sota/object-detection-on-coco?p=grounding-dino-marrying-dino-with-grounded)
 
@@ -402,4 +408,3 @@ If you find our work helpful for your research, please consider citing the follo
   year={2023}
 }
 ```
-
